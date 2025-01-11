@@ -1,0 +1,4 @@
+in_channels: 1
+lr: 0.001
+out_channels: 7
+pretrained: true
