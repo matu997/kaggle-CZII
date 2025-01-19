@@ -9,8 +9,60 @@ import timm
 from decoder import *
 
 #------------------------------------------------
-# processing
+# Jensen-Shannon ダイバージェンス損失の定義
+def jensen_shannon_divergence_loss(logits, mask, eps=1e-8):
+    """
+    ※この外側の関数でラベル(mask)をdetach()してfloat()に変換し、
+      内側の本来の計算部分は『一切変更しない』形にしています。
+    """
 
+    # --- ここでラベルを浮動小数化＆勾配を切り離し ---
+    mask_ = mask.detach().float()
+
+    #--- 以下に「元の実装部分」を全く同じにして埋め込み ---
+    def _original_js_loss(logits, mask, eps=1e-8):
+        """
+        logits: (B, 7, D, H, W) - ネットワーク出力 (生のロジット)
+        mask:   (B, 7, D, H, W) - 連続値のラベル(確率分布を想定)
+        eps:    log(0) 回避のための小さい値
+
+        1) Q = softmax(logits, dim=1)
+        2) P = mask を [eps,1] にクランプして確率分布とみなす
+        3) M = 0.5*(P + Q)
+        4) KL(P||M) = ∑ P * log(P/M) をチャネル方向で合計
+        5) JS = 0.5*(KL(P||M) + KL(Q||M))
+        6) 全ボクセル平均
+        """
+        # ラベルを確率分布に変換
+        mask = F.softmax(mask, dim=1)  
+        # ネットワーク予測確率 Q
+        Q = F.softmax(logits, dim=1).clamp(min=eps, max=1.0) 
+        # ラベル分布 P
+        P = mask.clamp(min=eps, max=1.0)                     
+        # 中間分布 M
+        M = 0.5 * (P + Q)
+
+        # KL(P||M), KL(Q||M) をチャネル方向(dim=1) で合計
+        KL_PM = (P * (torch.log(P) - torch.log(M))).sum(dim=1)
+        KL_QM = (Q * (torch.log(Q) - torch.log(M))).sum(dim=1)
+
+        # JS = 0.5 * (KL(P||M) + KL(Q||M))
+        JS = 0.5 * KL_PM + 0.5 * KL_QM
+
+        # 全ボクセル平均
+        #loss = JS.mean()
+        #全ポクセルの和
+        loss = JS.sum()
+        loss = loss / 500000  # バッチサイズで割る
+        return loss
+    #--- ここまで ---
+
+    # ラベルだけ処理したものを、上記の「元の実装」にそのまま渡す
+    return _original_js_loss(logits, mask_, eps)
+
+
+#------------------------------------------------
+# processing
 def encode_for_resnet(e, x, B, depth_scaling=[2,2,2,2,1]):
 
     def pool_in_depth(x, depth_scaling):
@@ -59,7 +111,8 @@ class Net(nn.Module):
         self.output_type = ['infer', 'loss', ]
         self.register_buffer('D', torch.tensor(0))
 
-        num_class=6+1
+        # 今回の例では 7 クラス (6 + 1) と仮定
+        num_class = 6 + 1
 
         self.arch = 'resnet34d'
         if cfg is not None:
@@ -82,18 +135,17 @@ class Net(nn.Module):
             'pvt_v2_b2': [64, 128, 320, 512],
             'pvt_v2_b4': [64, 128, 320, 512],
         }.get(self.arch, [768])
-        decoder_dim = \
-              [256, 128, 64, 32, 16]
+        decoder_dim = [256, 128, 64, 32, 16]
 
         self.encoder = timm.create_model(
             model_name=self.arch, pretrained=pretrained, in_chans=3, num_classes=0, global_pool='', features_only=True,
         )
         self.decoder = MyUnetDecoder3d(
             in_channel=encoder_dim[-1],
-            skip_channel=encoder_dim[:-1][::-1]+[0],
+            skip_channel=encoder_dim[:-1][::-1] + [0],
             out_channel=decoder_dim,
         )
-        self.mask = nn.Conv3d(decoder_dim[-1],num_class, kernel_size=1)
+        self.mask = nn.Conv3d(decoder_dim[-1], num_class, kernel_size=1)
 
     def forward(self, batch):
         device = self.D.device
@@ -105,75 +157,71 @@ class Net(nn.Module):
         x = (image.float() - 0.5) / 0.5
         x = x.expand(-1, 3, -1, -1)
 
-        #encode = self.encoder(x)[-5:]
+        # ResNet の出力 (マルチスケール特徴) を取得
         encode = encode_for_resnet(self.encoder, x, B, depth_scaling=[2,2,2,2,1])
-        #[print(f'encode_{i}', e.shape) for i,e in enumerate(encode)]
-
-        #[print(f'encode_{i}', e.shape) for i, e in enumerate(encode)]
+        
+        # デコーダに入力（skip connection の長さを合わせるために逆順にしている）
         last, decode = self.decoder(
-            feature=encode[-1], skip=encode[:-1][::-1]+[None], depth_scaling=[1,2,2,2,2]
+            feature=encode[-1], 
+            skip=encode[:-1][::-1] + [None], 
+            depth_scaling=[1,2,2,2,2]
         )
-        #print(f'last', last.shape)
 
+        # 3D Conv で最終出力(logits) を作る
         logit = self.mask(last)
-        print('logit', logit.shape)
 
         output = {}
         if 'loss' in self.output_type:
-            #<todo> weighted cross entropy
-            output['mask_loss'] = F.cross_entropy(logit, batch['mask'].to(device))
+            # ここを JS ダイバージェンス損失に置き換え
+            # 7クラス想定なので num_classes=7 を指定
+            output['mask_loss'] = jensen_shannon_divergence_loss(
+                logits=logit, 
+                mask=batch['label'].to(device)
+            )
 
         if 'infer' in self.output_type:
-            output['particle'] = F.softmax(logit,1)
+            # 予測確率 (softmax)
+            output['particle'] = F.softmax(logit, 1)
 
         return output
 
-''''
-to do:
-loss function optimization:
-- Since you are prioritizing the F-beta score with β=4, the positive class weight will likely need to be higher if positive samples are underrepresented
-- Grid Search or Hyperparameter Tuning 
-need to check if all pos ampels are annotated?
-(i.e. p+unlabelled learning)
-
-'''
 
 #------------------------------------------------------------------------
 def run_check_net():
-
-    B = 1
+    B = 4
     image_size = 640
     mask_size  = 640
-    num_slice = 32 #184
-    num_class=6+1
+    num_slice = 32  # 例: 3D方向に32スライス
+    num_class = 6 + 1
 
     batch = {
         'image': torch.from_numpy(np.random.uniform(0,1, (B,num_slice, image_size, image_size))).float(),
-        'mask': torch.from_numpy(np.random.choice(num_class, (B, num_slice, mask_size, mask_size))).long(),
+        'label': torch.from_numpy(np.random.randint(0, num_class, (B,num_slice, image_size, image_size))).long(),
     }
-    net = Net(pretrained=True, cfg=None).cuda()
+
+    net = Net(pretrained=False, cfg=None).cuda()
 
     with torch.no_grad():
-        with torch.amp.autocast('cuda',enabled=True):
+        with torch.amp.autocast('cuda', enabled=True):
             output = net(batch)
-    # ---
+
+    # --- 出力を確認
     print('batch')
     for k, v in batch.items():
         if k == 'D':
-            print(f'{k:>32} : {v} ')
+            print(f'{k:>32} : {v}')
         else:
-            print(f'{k:>32} : {v.shape} ')
+            print(f'{k:>32} : {v.shape}')
 
-    print('output')
+    print('\noutput')
     for k, v in output.items():
         if 'loss' not in k:
-            print(f'{k:>32} : {v.shape} ')
+            print(f'{k:>32} : {v.shape}')
     print('loss')
     for k, v in output.items():
         if 'loss' in k:
-            print(f'{k:>32} : {v.item()} ')
+            print(f'{k:>32} : {v.item()}')
 
 
-# main #################################################################
 if __name__ == '__main__':
     run_check_net()
