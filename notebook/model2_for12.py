@@ -84,7 +84,6 @@ class Net(nn.Module):
         }.get(self.arch, [768])
         decoder_dim = \
               [256, 128, 64, 32, 16]
-
         self.encoder = timm.create_model(
             model_name=self.arch, pretrained=pretrained, in_chans=3, num_classes=0, global_pool='', features_only=True,
         )
@@ -116,12 +115,12 @@ class Net(nn.Module):
         #print(f'last', last.shape)
 
         logit = self.mask(last)
-        print('logit', logit.shape)
+        #print('logit', logit.shape)
 
         output = {}
         if 'loss' in self.output_type:
             #<todo> weighted cross entropy
-            output['mask_loss'] = F.cross_entropy(logit, batch['mask'].to(device))
+            output['mask_loss'] = F.cross_entropy(logit, batch['label'].to(device))
 
         if 'infer' in self.output_type:
             output['particle'] = F.softmax(logit,1)
@@ -141,7 +140,7 @@ need to check if all pos ampels are annotated?
 #------------------------------------------------------------------------
 def run_check_net():
 
-    B = 1
+    B = 4
     image_size = 640
     mask_size  = 640
     num_slice = 32 #184
