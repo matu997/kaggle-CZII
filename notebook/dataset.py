@@ -101,3 +101,39 @@ def read_one_truth(id, overlay_dir):
         location[p] = loc
 
     return location
+
+mask_size= {
+    "defolt" : 1,
+    "apo-ferritin" : 6,
+    'beta-amylase' : 6.5, 
+    'beta-galactosidase' : 9, 
+    'ribosome' : 15, 
+    'thyroglobulin' : 13, 
+    'virus-like-particle' : 13.5,
+}
+def read_diff_data(id, static_dir,name):
+    zarr_dir = f'{static_dir}/{id}/VoxelSpacing10.000'
+    zarr_file = f'{zarr_dir}/{name}.zarr'
+    zarr_data = zarr.open(zarr_file, mode='r')
+    volume = zarr_data[0][:]
+    max = volume.max()
+    min = volume.min()
+    volume = (volume - min) / (max - min)
+    volume = volume.astype(np.float16)
+    return volume
+
+def read_log_diff(id, static_dir,name):
+    zarr_dir = f'{static_dir}/{id}/VoxelSpacing10.000'
+    zarr_file = f'{zarr_dir}/{name}.zarr'
+    zarr_data = zarr.open(zarr_file, mode='r')
+    volume = zarr_data[0][:]
+    max = volume.max()
+    min = volume.min()
+    volume = (volume - min) / (max - min)
+    #log
+    volume = np.log(volume+1e-6)
+    max = volume.max()
+    min = volume.min()
+    volume = (volume - min) / (max - min)
+    volume = volume.astype(np.float16)
+    return volume
