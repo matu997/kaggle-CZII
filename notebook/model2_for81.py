@@ -1,0 +1,162 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import timm
+#from timm.models.convnext import *
+from decoder import *
+
+#------------------------------------------------
+# processing
+
+def encode_for_resnet(e, x, B, depth_scaling=[2,2,2,2,1]):
+    def pool_in_depth(x, depth_scaling):
+        bd, c, h, w = x.shape
+        x1 = x.reshape(B, -1, c, h, w).permute(0, 2, 1, 3, 4)
+        x1 = F.avg_pool3d(x1, kernel_size=(depth_scaling, 1, 1), stride=(depth_scaling, 1, 1), padding=0)
+        x = x1.permute(0, 2, 1, 3, 4).reshape(-1, c, h, w)
+        return x, x1
+
+    encode = []
+    x = e.conv1(x)
+    # ここで従来の bn1 ではなく、instance normalization を用いるように変更済み
+    x = e.bn1(x)
+    x = e.act1(x)
+    x, x1 = pool_in_depth(x, depth_scaling[0])
+    encode.append(x1)
+    #print(x.shape)
+    #x = e.maxpool(x)
+    x = F.avg_pool2d(x, kernel_size=2, stride=2)
+
+    x = e.layer1(x)
+    x, x1 = pool_in_depth(x, depth_scaling[1])
+    encode.append(x1)
+    #print(x.shape)
+
+    x = e.layer2(x)
+    x, x1 = pool_in_depth(x, depth_scaling[2])
+    encode.append(x1)
+    #print(x.shape)
+
+    x = e.layer3(x)
+    x, x1 = pool_in_depth(x, depth_scaling[3])
+    encode.append(x1)
+    #print(x.shape)
+
+    x = e.layer4(x)
+    x, x1 = pool_in_depth(x, depth_scaling[4])
+    encode.append(x1)
+    #print(x.shape)
+
+    return encode
+
+
+class Net(nn.Module):
+    def __init__(self, pretrained=False, cfg=None):
+        super(Net, self).__init__()
+        self.output_type = ['infer', 'loss']
+        self.register_buffer('D', torch.tensor(0))
+
+        num_class = 6 + 1
+
+        self.arch = 'resnet34d'
+        if cfg is not None:
+            self.arch = cfg.arch
+
+        encoder_dim = {
+            'resnet18': [64, 64, 128, 256, 512],
+            'resnet18d': [64, 64, 128, 256, 512],
+            'resnet34d': [64, 64, 128, 256, 512],
+            'resnet50d': [64, 256, 512, 1024, 2048],
+            'seresnext26d_32x4d': [64, 256, 512, 1024, 2048],
+            'convnext_small.fb_in22k': [96, 192, 384, 768],
+            'convnext_tiny.fb_in22k': [96, 192, 384, 768],
+            'convnext_base.fb_in22k': [128, 256, 512, 1024],
+            'tf_efficientnet_b4.ns_jft_in1k': [32, 56, 160, 448],
+            'tf_efficientnet_b5.ns_jft_in1k': [40, 64, 176, 512],
+            'tf_efficientnet_b6.ns_jft_in1k': [40, 72, 200, 576],
+            'tf_efficientnet_b7.ns_jft_in1k': [48, 80, 224, 640],
+            'pvt_v2_b1': [64, 128, 320, 512],
+            'pvt_v2_b2': [64, 128, 320, 512],
+            'pvt_v2_b4': [64, 128, 320, 512],
+        }.get(self.arch, [768])
+        decoder_dim = [256, 128, 64, 32, 16]
+
+        # エンコーダを作成（features_only=Trueで中間特徴量を抽出）
+        self.encoder = timm.create_model(
+            model_name=self.arch, pretrained=pretrained, in_chans=3,
+            num_classes=0, global_pool='', features_only=True,
+        )
+        # ここで、エンコーダ内部の bn1 を InstanceNorm2d に置換する
+        self.encoder.bn1 = nn.InstanceNorm2d(
+            self.encoder.bn1.num_features, affine=True, track_running_stats=False
+        )
+
+        self.decoder = MyUnetDecoder3d(
+            in_channel=encoder_dim[-1],
+            skip_channel=encoder_dim[:-1][::-1] + [0],
+            out_channel=decoder_dim,
+        )
+        self.mask = nn.Conv3d(decoder_dim[-1], num_class, kernel_size=1)
+
+    def forward(self, batch):
+        device = self.D.device
+
+        image = batch['image'].to(device)
+        B, D, H, W = image.shape
+        image = image.reshape(B * D, 1, H, W)
+
+        x = (image.float() - 0.5) / 0.5
+        x = x.expand(-1, 3, -1, -1)
+
+        # エンコーダで特徴抽出
+        encode = encode_for_resnet(self.encoder, x, B, depth_scaling=[2,2,2,2,1])
+        # デコーダにより3D特徴マップに変換
+        last, decode = self.decoder(
+            feature=encode[-1], skip=encode[:-1][::-1] + [None], depth_scaling=[1,2,2,2,2]
+        )
+        logit = self.mask(last)
+
+        output = {}
+        if 'loss' in self.output_type:
+            # 重み付き交差エントロピー損失（例）
+            weight = torch.tensor([1.0, 1.0, 0, 1.0, 1.0, 1.0, 1.0]).to(device)
+            output['mask_loss'] = F.cross_entropy(logit, batch['mask'].to(device), weight=weight)
+        if 'infer' in self.output_type:
+            output['particle'] = F.softmax(logit, dim=1)
+
+        return output
+
+
+def run_check_net():
+    B = 4
+    image_size = 640
+    mask_size  = 640
+    num_slice = 32  # 例として32枚
+    num_class = 6 + 1
+
+    batch = {
+        'image': torch.from_numpy(np.random.uniform(0, 1, (B, num_slice, image_size, image_size))).float(),
+        'mask': torch.from_numpy(np.random.choice(num_class, (B, num_slice, mask_size, mask_size))).long(),
+    }
+    net = Net(pretrained=True, cfg=None).cuda()
+
+    with torch.no_grad():
+        with torch.amp.autocast('cuda', enabled=True):
+            output = net(batch)
+    # ---
+    print('batch')
+    for k, v in batch.items():
+        print(f'{k:>32} : {v.shape} ' if k != 'D' else f'{k:>32} : {v}')
+    print('output')
+    for k, v in output.items():
+        if 'loss' not in k:
+            print(f'{k:>32} : {v.shape} ')
+    print('loss')
+    for k, v in output.items():
+        if 'loss' in k:
+            print(f'{k:>32} : {v.item()} ')
+
+
+if __name__ == '__main__':
+    run_check_net()
